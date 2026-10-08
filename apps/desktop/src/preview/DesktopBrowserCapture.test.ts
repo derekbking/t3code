@@ -44,11 +44,11 @@ const makeGuest = (id = 41) => {
     nativeStarted,
     screenshotStarted,
     tab: {
-      withCaptureActivity: (capture: () => Promise<unknown>) => capture(),
+      withCaptureActivity: <A, E>(capture: Effect.Effect<A, E>) => capture,
       webContents: {
         id,
         capturePage,
-        isDestroyed: () => false,
+        isDestroyed: vi.fn(() => false),
         getURL: () => "http://localhost/",
         getTitle: () => "Fixture",
         getUserAgent: () => "Electron",
@@ -139,6 +139,45 @@ describe("desktop agent screenshot rendering lease", () => {
       expect((yield* Queue.take(replies)).id).toBe(2);
       expect(guest.capturePage).not.toHaveBeenCalled();
     }).pipe(Effect.scoped),
+  );
+
+  it.effect("reports a destroyed guest with one capture failure prefix", () =>
+    Effect.gen(function* () {
+      const { guest, leases, replies, command, acknowledge } = yield* setup;
+      yield* command(1);
+      vi.mocked(guest.tab.webContents.isDestroyed).mockReturnValue(true);
+      const active = yield* acknowledge;
+      expect((yield* Queue.take(replies)).error?.message).toBe(
+        "Desktop browser screenshot failed: the browser tab changed during capture.",
+      );
+      expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
+      expect(guest.capturePage).not.toHaveBeenCalled();
+      expect(guest.screenshot).not.toHaveBeenCalled();
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each(["native", "cdp"] as const)(
+    "reports a stable capture error when %s fails and allows a retry",
+    (failedStage) =>
+      Effect.gen(function* () {
+        const { guest, leases, replies, command, acknowledge } = yield* setup;
+        const cause = new Error("internal compositor failure detail");
+        const captureFailed = vi.fn<(error: unknown) => void>();
+        guest.tab.withCaptureActivity = (capture) =>
+          capture.pipe(Effect.tapError((error) => Effect.sync(() => captureFailed(error))));
+        if (failedStage === "native") guest.capturePage.mockRejectedValueOnce(cause);
+        else guest.screenshot.mockRejectedValueOnce(cause);
+        yield* command(1);
+        const active = yield* acknowledge;
+        expect((yield* Queue.take(replies)).error?.message).toBe(
+          "Desktop browser screenshot failed: the compositor could not capture a frame.",
+        );
+        expect(captureFailed).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ cause }));
+        expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
+        yield* command(2);
+        yield* acknowledge;
+        expect(yield* Queue.take(replies)).toEqual({ id: 2, result: { data: "encoded-by-cdp" } });
+      }).pipe(Effect.scoped),
   );
 
   it.effect.each(["native", "cdp"] as const)(

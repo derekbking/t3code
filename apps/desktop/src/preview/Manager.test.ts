@@ -2791,9 +2791,9 @@ describe("PreviewManager", () => {
     ),
   );
 
-  effectIt.effect(
-    "shares agent screenshot throttling with a recording and restores it after timeout",
-    () =>
+  effectIt.effect.each(["timeout", "release"] as const)(
+    "shares agent screenshot throttling with a recording and restores it after %s",
+    (endCapture) =>
       Effect.gen(function* () {
         const browserHost = yield* DesktopBrowserHost.DesktopBrowserHost;
         const manager = yield* PreviewManager.PreviewManager;
@@ -2824,7 +2824,10 @@ describe("PreviewManager", () => {
         yield* manager.createTab("capture", { serverTab });
         yield* manager.registerWebview("capture", 42);
         expect(yield* Queue.take(lines)).toContain('"attached"');
-        const setBackgroundThrottling = vi.fn();
+        const restored = Promise.withResolvers<void>();
+        const setBackgroundThrottling = vi.fn((enabled: boolean) => {
+          if (enabled) restored.resolve();
+        });
         yield* manager.setMainWindow({
           isDestroyed: () => false,
           once: vi.fn(),
@@ -2852,8 +2855,13 @@ describe("PreviewManager", () => {
         yield* manager.stopRecording("capture");
         expect(setBackgroundThrottling.mock.calls).toEqual([[false]]);
         expect(contents.setBackgroundThrottling.mock.calls).toEqual([[false]]);
-        yield* TestClock.adjust("8 seconds");
-        expect(yield* Queue.take(lines)).toContain("within 8 seconds");
+        if (endCapture === "timeout") {
+          yield* TestClock.adjust("8 seconds");
+          expect(yield* Queue.take(lines)).toContain("within 8 seconds");
+        } else {
+          yield* browserHost.handleCommandLine(JSON.stringify({ type: "release", ...serverTab }));
+        }
+        yield* Effect.promise(() => restored.promise);
         expect(setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
         expect(contents.setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
         pending.resolve(image);

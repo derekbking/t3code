@@ -556,7 +556,6 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const browserHost = yield* DesktopBrowserHost.DesktopBrowserHost;
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
-  const runPromise = Effect.runPromiseWith(context);
   const resolvedArtifactDirectory = path.resolve(artifactDirectory);
 
   let forwardedShortcuts: ReadonlyArray<PreviewForwardedShortcut> = [];
@@ -2381,17 +2380,15 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         browserHost.attach(afterAttach.serverTab, {
           webContents: wc,
           debugger: control.debugger,
-          withCaptureActivity: (capture, signal) => {
-            const consumer = Symbol("agent-screenshot");
-            return runPromise(
-              Effect.acquireUseRelease(
+          withCaptureActivity: (capture) =>
+            Effect.suspend(() => {
+              const consumer = Symbol("agent-screenshot");
+              return Effect.acquireUseRelease(
                 startFrameCapture(tabId, consumer),
-                () => Effect.promise((_signal) => capture()),
+                () => capture,
                 () => stopFrameCapture(tabId, consumer),
-              ),
-              { signal },
-            );
-          },
+              );
+            }),
         });
       }
       if (afterAttach.colorScheme !== "system") {

@@ -27,6 +27,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { createCdpRelayConnection, type CdpRelayConnection } from "./CdpRelay.ts";
+import type { PreviewManagerError } from "./Manager.ts";
 
 const encodeEvent = Schema.encodeSync(Schema.fromJsonString(DesktopBrowserEvent));
 const decodeCommand = Schema.decodeUnknownOption(Schema.fromJsonString(DesktopBrowserCommand));
@@ -42,20 +43,21 @@ export interface DesktopBrowserTabDebugger {
   readonly webContents: Electron.WebContents;
   readonly debugger: Electron.Debugger;
   /** Shares the manager's recording/PiP throttling lease while preparing a still frame. */
-  readonly withCaptureActivity: (
-    capture: () => Promise<unknown>,
-    signal: AbortSignal,
-  ) => Promise<unknown>;
+  readonly withCaptureActivity: <A, E>(
+    capture: Effect.Effect<A, E>,
+  ) => Effect.Effect<A, E | PreviewManagerError>;
 }
 
 class DesktopBrowserCaptureError extends Schema.TaggedError<DesktopBrowserCaptureError>()(
   "DesktopBrowserCaptureError",
-  { reason: Schema.String },
+  { reason: Schema.String, cause: Schema.optional(Schema.Defect()) },
 ) {
   override get message(): string {
     return `Desktop browser screenshot failed: ${this.reason}`;
   }
 }
+
+const isDesktopBrowserCaptureError = Schema.is(DesktopBrowserCaptureError);
 
 const keyOf = ({ threadId, tabId }: DesktopBrowserTabKey) => `${threadId}\u0000${tabId}`;
 
@@ -140,105 +142,102 @@ export const make = Effect.gen(function* () {
       }
     };
     try {
-      return await tab.debuggee.withCaptureActivity(
-        () =>
-          runPromise(
-            Effect.acquireUseRelease(
+      return await runPromise(
+        tab.debuggee.withCaptureActivity(
+          Effect.acquireUseRelease(
+            Effect.gen(function* () {
+              const ready = yield* Deferred.make<void>();
+              const requestId = NodeCrypto.randomUUID();
+              pendingCaptures.set(requestId, ready);
+              return { requestId, ready, webContentsId: webContents.id };
+            }),
+            ({ requestId, ready, webContentsId }) =>
               Effect.gen(function* () {
-                const ready = yield* Deferred.make<void>();
-                const requestId = NodeCrypto.randomUUID();
-                pendingCaptures.set(requestId, ready);
-                return { requestId, ready, webContentsId: webContents.id };
-              }),
-              ({ requestId, ready, webContentsId }) =>
-                Effect.gen(function* () {
-                  yield* PubSub.publish(captureRequests, {
-                    requestId,
-                    webContentsId,
-                    active: true,
-                  });
-                  yield* Deferred.await(ready).pipe(
-                    Effect.timeoutOrElse({
-                      duration: "2 seconds",
-                      orElse: () =>
-                        Effect.fail(
-                          new DesktopBrowserCaptureError({
-                            reason:
-                              "the browser surface did not become paintable within 2 seconds.",
-                          }),
-                        ),
-                    }),
-                  );
-                  return yield* Effect.tryPromise({
-                    try: (signal) => {
-                      pending = (async () => {
-                        requireCurrent(signal);
-                        // CDP may resize the surface for a scaled clip. Request its
-                        // screenshot first, then produce an initial frame and, if
-                        // CDP is still waiting, a frame after that capture setup.
-                        let screenshotSettled = false;
-                        const screenshotRequest = Promise.resolve()
-                          .then(() => debuggee.sendCommand("Page.captureScreenshot", parameters))
-                          .finally(() => {
-                            screenshotSettled = true;
+                yield* PubSub.publish(captureRequests, {
+                  requestId,
+                  webContentsId,
+                  active: true,
+                });
+                yield* Deferred.await(ready).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "2 seconds",
+                    orElse: () =>
+                      Effect.fail(
+                        new DesktopBrowserCaptureError({
+                          reason: "the browser surface did not become paintable within 2 seconds.",
+                        }),
+                      ),
+                  }),
+                );
+                return yield* Effect.tryPromise({
+                  try: (signal) => {
+                    pending = (async () => {
+                      requireCurrent(signal);
+                      // CDP may resize the surface for a scaled clip. Request its
+                      // screenshot first, then produce an initial frame and, if
+                      // CDP is still waiting, a frame after that capture setup.
+                      let screenshotSettled = false;
+                      const screenshotRequest = Promise.resolve()
+                        .then(() => debuggee.sendCommand("Page.captureScreenshot", parameters))
+                        .finally(() => {
+                          screenshotSettled = true;
+                        });
+                      // Neither API is cancellable. Retain the slot until both
+                      // settle, including when one rejects or the caller times out.
+                      const [screenshot, warmup] = await Promise.allSettled([
+                        screenshotRequest,
+                        Promise.resolve().then(async () => {
+                          await webContents.capturePage(undefined, {
+                            stayHidden: true,
+                            stayAwake: false,
                           });
-                        // Neither API is cancellable. Retain the slot until both
-                        // settle, including when one rejects or the caller times out.
-                        const [screenshot, warmup] = await Promise.allSettled([
-                          screenshotRequest,
-                          Promise.resolve().then(async () => {
+                          requireCurrent(signal);
+                          if (!screenshotSettled) {
                             await webContents.capturePage(undefined, {
                               stayHidden: true,
                               stayAwake: false,
                             });
-                            requireCurrent(signal);
-                            if (!screenshotSettled) {
-                              await webContents.capturePage(undefined, {
-                                stayHidden: true,
-                                stayAwake: false,
-                              });
-                            }
-                          }),
-                        ]);
-                        requireCurrent(signal);
-                        if (screenshot.status === "rejected") throw screenshot.reason;
-                        if (warmup.status === "rejected") throw warmup.reason;
-                        return screenshot.value;
-                      })();
-                      return pending;
-                    },
-                    catch: (cause) =>
-                      new DesktopBrowserCaptureError({
-                        reason:
-                          cause instanceof Error
-                            ? cause.message
-                            : "the compositor could not capture a frame.",
-                      }),
-                  }).pipe(
-                    Effect.timeoutOrElse({
-                      duration: "8 seconds",
-                      orElse: () =>
-                        Effect.fail(
-                          new DesktopBrowserCaptureError({
-                            reason: "the compositor did not supply a screenshot within 8 seconds.",
-                          }),
-                        ),
-                    }),
-                  );
-                }),
-              ({ requestId, webContentsId }) =>
-                Effect.gen(function* () {
-                  pendingCaptures.delete(requestId);
-                  yield* PubSub.publish(captureRequests, {
-                    requestId,
-                    webContentsId,
-                    active: false,
-                  });
-                }),
-            ),
-            { signal: relaySignal },
+                          }
+                        }),
+                      ]);
+                      requireCurrent(signal);
+                      if (screenshot.status === "rejected") throw screenshot.reason;
+                      if (warmup.status === "rejected") throw warmup.reason;
+                      return screenshot.value;
+                    })();
+                    return pending;
+                  },
+                  catch: (cause) =>
+                    isDesktopBrowserCaptureError(cause)
+                      ? cause
+                      : new DesktopBrowserCaptureError({
+                          reason: "the compositor could not capture a frame.",
+                          cause,
+                        }),
+                }).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "8 seconds",
+                    orElse: () =>
+                      Effect.fail(
+                        new DesktopBrowserCaptureError({
+                          reason: "the compositor did not supply a screenshot within 8 seconds.",
+                        }),
+                      ),
+                  }),
+                );
+              }),
+            ({ requestId, webContentsId }) =>
+              Effect.gen(function* () {
+                pendingCaptures.delete(requestId);
+                yield* PubSub.publish(captureRequests, {
+                  requestId,
+                  webContentsId,
+                  active: false,
+                });
+              }),
           ),
-        relaySignal,
+        ),
+        { signal: relaySignal },
       );
     } finally {
       const release = () => {

@@ -37,7 +37,7 @@ const makeDebuggee = () => {
   };
   return {
     tab: {
-      withCaptureActivity: (capture: () => Promise<unknown>) => capture(),
+      withCaptureActivity: <A, E>(capture: Effect.Effect<A, E>) => capture,
       webContents: webContents as unknown as Electron.WebContents,
       debugger: debuggee as unknown as Electron.Debugger,
     },
