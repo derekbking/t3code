@@ -2836,6 +2836,12 @@ describe("PreviewManager", () => {
         yield* manager.startRecording("capture");
         const started = Promise.withResolvers<void>();
         const pending = Promise.withResolvers<typeof image>();
+        const pendingScreenshot = Promise.withResolvers<unknown>();
+        vi.mocked(contents.debugger.sendCommand).mockImplementation((method) =>
+          method === "Page.captureScreenshot"
+            ? pendingScreenshot.promise
+            : Promise.resolve(undefined),
+        );
         capturePage.mockImplementationOnce(() => {
           started.resolve();
           return pending.promise;
@@ -2865,6 +2871,7 @@ describe("PreviewManager", () => {
         expect(setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
         expect(contents.setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
         pending.resolve(image);
+        pendingScreenshot.resolve({ data: "discarded" });
       }).pipe(Effect.provide(managerLayer()), Effect.scoped),
   );
 

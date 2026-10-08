@@ -147,6 +147,23 @@ describe("HostedBrowserWebview settings hydration", () => {
       });
     await send("other-guest", true, 42);
     expect(useBrowserSurfaceStore.getState().activityByTabId[runtimeTabId]).toBeUndefined();
+    let releaseOtherActivity: () => void = () => undefined;
+    await act(() => {
+      releaseOtherActivity = useBrowserSurfaceStore.getState().acquireActivity(runtimeTabId);
+    });
+    await send("cancelled", true);
+    expect(useBrowserSurfaceStore.getState().activityByTabId[runtimeTabId]).toBe(2);
+    await act(() => {
+      for (const frame of frames.splice(0)) frame(1);
+    });
+    await send("cancelled", false);
+    await act(() => {
+      for (const frame of frames.splice(0)) frame(2);
+    });
+    expect(acknowledgeCapture).not.toHaveBeenCalled();
+    // Cancelling a screenshot must preserve another consumer's activity lease.
+    expect(useBrowserSurfaceStore.getState().activityByTabId[runtimeTabId]).toBe(1);
+    await act(releaseOtherActivity);
     await send("first", true);
     await send("second", true);
     await send("first", true); // Duplicate IPC delivery must not leak a lease.

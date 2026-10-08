@@ -50,10 +50,20 @@ export interface DesktopBrowserTabDebugger {
 
 class DesktopBrowserCaptureError extends Schema.TaggedError<DesktopBrowserCaptureError>()(
   "DesktopBrowserCaptureError",
-  { reason: Schema.String, cause: Schema.optional(Schema.Defect()) },
+  {
+    reason: Schema.Literals(["pending", "changed", "paint-timeout", "capture-timeout", "failed"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
 ) {
   override get message(): string {
-    return `Desktop browser screenshot failed: ${this.reason}`;
+    const details = {
+      pending: "a previous capture is still pending.",
+      changed: "the browser tab changed during capture.",
+      "paint-timeout": "the browser surface did not become paintable within 2 seconds.",
+      "capture-timeout": "the compositor did not supply a screenshot within 8 seconds.",
+      failed: "the compositor could not capture a frame.",
+    };
+    return `Desktop browser screenshot failed: ${details[this.reason]}`;
   }
 }
 
@@ -131,14 +141,14 @@ export const make = Effect.gen(function* () {
   ) => {
     const { webContents, debugger: debuggee } = tab.debuggee;
     if (capturing.has(webContents)) {
-      throw new DesktopBrowserCaptureError({ reason: "a previous capture is still pending." });
+      throw new DesktopBrowserCaptureError({ reason: "pending" });
     }
     capturing.add(webContents);
     let pending: Promise<unknown> | undefined;
     const requireCurrent = (signal: AbortSignal) => {
       signal.throwIfAborted();
       if (tabs.get(keyOf(tab.key)) !== tab || webContents.isDestroyed()) {
-        throw new DesktopBrowserCaptureError({ reason: "the browser tab changed during capture." });
+        throw new DesktopBrowserCaptureError({ reason: "changed" });
       }
     };
     try {
@@ -164,54 +174,52 @@ export const make = Effect.gen(function* () {
                     orElse: () =>
                       Effect.fail(
                         new DesktopBrowserCaptureError({
-                          reason: "the browser surface did not become paintable within 2 seconds.",
+                          reason: "paint-timeout",
                         }),
                       ),
                   }),
                 );
                 return yield* Effect.tryPromise({
-                  try: (signal) => {
-                    pending = (async () => {
-                      requireCurrent(signal);
-                      // CDP may resize the surface for a scaled clip. Request its
-                      // screenshot first, then produce an initial frame and, if
-                      // CDP is still waiting, a frame after that capture setup.
-                      let screenshotSettled = false;
-                      const screenshotRequest = Promise.resolve()
-                        .then(() => debuggee.sendCommand("Page.captureScreenshot", parameters))
-                        .finally(() => {
-                          screenshotSettled = true;
+                  try: async (signal) => {
+                    requireCurrent(signal);
+                    // CDP may resize the surface for a scaled clip. Request its
+                    // screenshot first, then produce an initial frame and, if
+                    // CDP is still waiting, a frame after that capture setup.
+                    let screenshotSettled = false;
+                    const screenshotRequest = Promise.resolve()
+                      .then(() => debuggee.sendCommand("Page.captureScreenshot", parameters))
+                      .finally(() => {
+                        screenshotSettled = true;
+                      });
+                    // Neither API is cancellable. Retain the slot until both
+                    // settle, including when one rejects or the caller times out.
+                    pending = Promise.allSettled([
+                      screenshotRequest,
+                      Promise.resolve().then(async () => {
+                        await webContents.capturePage(undefined, {
+                          stayHidden: true,
+                          stayAwake: false,
                         });
-                      // Neither API is cancellable. Retain the slot until both
-                      // settle, including when one rejects or the caller times out.
-                      const [screenshot, warmup] = await Promise.allSettled([
-                        screenshotRequest,
-                        Promise.resolve().then(async () => {
+                        requireCurrent(signal);
+                        if (!screenshotSettled) {
                           await webContents.capturePage(undefined, {
                             stayHidden: true,
                             stayAwake: false,
                           });
-                          requireCurrent(signal);
-                          if (!screenshotSettled) {
-                            await webContents.capturePage(undefined, {
-                              stayHidden: true,
-                              stayAwake: false,
-                            });
-                          }
-                        }),
-                      ]);
-                      requireCurrent(signal);
-                      if (screenshot.status === "rejected") throw screenshot.reason;
-                      if (warmup.status === "rejected") throw warmup.reason;
-                      return screenshot.value;
-                    })();
-                    return pending;
+                        }
+                      }),
+                    ]);
+                    // Native capture only requests paint; its unused image must
+                    // not delay or replace CDP's screenshot result.
+                    const screenshot = await screenshotRequest;
+                    requireCurrent(signal);
+                    return screenshot;
                   },
                   catch: (cause) =>
                     isDesktopBrowserCaptureError(cause)
                       ? cause
                       : new DesktopBrowserCaptureError({
-                          reason: "the compositor could not capture a frame.",
+                          reason: "failed",
                           cause,
                         }),
                 }).pipe(
@@ -220,7 +228,7 @@ export const make = Effect.gen(function* () {
                     orElse: () =>
                       Effect.fail(
                         new DesktopBrowserCaptureError({
-                          reason: "the compositor did not supply a screenshot within 8 seconds.",
+                          reason: "capture-timeout",
                         }),
                       ),
                   }),

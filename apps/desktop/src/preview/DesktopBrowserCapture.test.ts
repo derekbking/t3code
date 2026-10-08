@@ -156,53 +156,62 @@ describe("desktop agent screenshot rendering lease", () => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect.each(["native", "cdp"] as const)(
-    "reports a stable capture error when %s fails and allows a retry",
-    (failedStage) =>
+  it.effect.each(["reject", "throw"] as const)(
+    "returns the CDP screenshot even if native warmup fails with %s",
+    (failure) =>
       Effect.gen(function* () {
         const { guest, leases, replies, command, acknowledge } = yield* setup;
-        const cause = new Error("internal compositor failure detail");
-        const captureFailed = vi.fn<(error: unknown) => void>();
-        guest.tab.withCaptureActivity = (capture) =>
-          capture.pipe(Effect.tapError((error) => Effect.sync(() => captureFailed(error))));
-        if (failedStage === "native") guest.capturePage.mockRejectedValueOnce(cause);
-        else guest.screenshot.mockRejectedValueOnce(cause);
+        const cause = new Error("native unavailable");
+        if (failure === "reject") guest.capturePage.mockRejectedValueOnce(cause);
+        else
+          guest.capturePage.mockImplementationOnce(() => {
+            throw cause;
+          });
         yield* command(1);
         const active = yield* acknowledge;
-        expect((yield* Queue.take(replies)).error?.message).toBe(
-          "Desktop browser screenshot failed: the compositor could not capture a frame.",
-        );
-        expect(captureFailed).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ cause }));
+        expect(yield* Queue.take(replies)).toEqual({ id: 1, result: { data: "encoded-by-cdp" } });
         expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
-        yield* command(2);
-        yield* acknowledge;
-        expect(yield* Queue.take(replies)).toEqual({ id: 2, result: { data: "encoded-by-cdp" } });
       }).pipe(Effect.scoped),
   );
 
-  it.effect.each(["native", "cdp"] as const)(
-    "bounds %s waiting without accumulating captures or blocking DOM commands",
-    (stalledStage) =>
+  it.effect("preserves the CDP failure cause and allows a retry", () =>
+    Effect.gen(function* () {
+      const { guest, leases, replies, command, acknowledge } = yield* setup;
+      const cause = new Error("internal compositor failure detail");
+      const captureFailed = vi.fn<(error: unknown) => void>();
+      guest.tab.withCaptureActivity = (capture) =>
+        capture.pipe(Effect.tapError((error) => Effect.sync(() => captureFailed(error))));
+      guest.screenshot.mockRejectedValueOnce(cause);
+      yield* command(1);
+      const active = yield* acknowledge;
+      expect((yield* Queue.take(replies)).error?.message).toBe(
+        "Desktop browser screenshot failed: the compositor could not capture a frame.",
+      );
+      expect(captureFailed).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ cause }));
+      expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
+      yield* command(2);
+      yield* acknowledge;
+      expect(yield* Queue.take(replies)).toEqual({ id: 2, result: { data: "encoded-by-cdp" } });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each(["success", "failure"] as const)(
+    "returns CDP %s while retaining the slot for pending native work",
+    (outcome) =>
       Effect.gen(function* () {
         const { guest, leases, replies, command, acknowledge } = yield* setup;
-        const pending = Promise.withResolvers<{ data: string }>();
-        if (stalledStage === "native")
-          guest.capturePage.mockImplementationOnce(() => {
-            guest.nativeStarted.resolve();
-            return pending.promise;
-          });
-        else
-          guest.screenshot.mockImplementationOnce(() => {
-            guest.screenshotStarted.resolve();
-            return pending.promise;
-          });
+        const pending = Promise.withResolvers<object>();
+        guest.capturePage.mockImplementationOnce(() => pending.promise);
+        if (outcome === "failure") guest.screenshot.mockRejectedValueOnce(new Error("CDP failed"));
         yield* command(1);
         const active = yield* acknowledge;
-        yield* Effect.promise(
-          () => (stalledStage === "native" ? guest.nativeStarted : guest.screenshotStarted).promise,
-        );
-        yield* TestClock.adjust("8 seconds");
-        expect((yield* Queue.take(replies)).error?.message).toContain("within 8 seconds");
+        const reply = yield* Queue.take(replies);
+        if (outcome === "success")
+          expect(reply).toEqual({ id: 1, result: { data: "encoded-by-cdp" } });
+        else
+          expect(reply.error?.message).toBe(
+            "Desktop browser screenshot failed: the compositor could not capture a frame.",
+          );
         expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
         yield* command(2);
         expect((yield* Queue.take(replies)).error?.message).toContain(
@@ -210,17 +219,44 @@ describe("desktop agent screenshot rendering lease", () => {
         );
         yield* command(3, "DOM.enable");
         expect((yield* Queue.take(replies)).id).toBe(3);
-        expect(guest.capturePage).toHaveBeenCalledTimes(stalledStage === "cdp" ? 2 : 1);
-        pending.resolve({ data: "late-image" });
+        pending.resolve({});
         yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)));
-        expect(guest.screenshot).toHaveBeenCalledTimes(1);
+        expect(guest.capturePage).toHaveBeenCalledTimes(1);
         yield* command(4);
         yield* acknowledge;
         expect(yield* Queue.take(replies)).toEqual({ id: 4, result: { data: "encoded-by-cdp" } });
-        expect(guest.capturePage.mock.calls.length).toBeLessThanOrEqual(
-          stalledStage === "cdp" ? 4 : 3,
-        );
       }).pipe(Effect.scoped),
+  );
+
+  it.effect("bounds CDP waiting without accumulating captures or blocking DOM commands", () =>
+    Effect.gen(function* () {
+      const { guest, leases, replies, command, acknowledge } = yield* setup;
+      const pending = Promise.withResolvers<{ data: string }>();
+      guest.screenshot.mockImplementationOnce(() => {
+        guest.screenshotStarted.resolve();
+        return pending.promise;
+      });
+      yield* command(1);
+      const active = yield* acknowledge;
+      yield* Effect.promise(() => guest.screenshotStarted.promise);
+      yield* TestClock.adjust("8 seconds");
+      expect((yield* Queue.take(replies)).error?.message).toContain("within 8 seconds");
+      expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
+      yield* command(2);
+      expect((yield* Queue.take(replies)).error?.message).toContain(
+        "previous capture is still pending",
+      );
+      yield* command(3, "DOM.enable");
+      expect((yield* Queue.take(replies)).id).toBe(3);
+      expect(guest.capturePage).toHaveBeenCalledTimes(2);
+      pending.resolve({ data: "late-image" });
+      yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)));
+      expect(guest.screenshot).toHaveBeenCalledTimes(1);
+      yield* command(4);
+      yield* acknowledge;
+      expect(yield* Queue.take(replies)).toEqual({ id: 4, result: { data: "encoded-by-cdp" } });
+      expect(guest.capturePage.mock.calls.length).toBeLessThanOrEqual(4);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("retains the pending CDP slot when native capture throws synchronously", () =>
@@ -258,7 +294,8 @@ describe("desktop agent screenshot rendering lease", () => {
     (lifecycle) =>
       Effect.gen(function* () {
         const { host, guest, leases, replies, command, acknowledge } = yield* setup;
-        const pending = Promise.withResolvers<object>();
+        const pending = Promise.withResolvers<{ data: string }>();
+        guest.screenshot.mockImplementationOnce(() => pending.promise);
         guest.capturePage.mockImplementationOnce(() => {
           guest.nativeStarted.resolve();
           return pending.promise;
@@ -272,7 +309,7 @@ describe("desktop agent screenshot rendering lease", () => {
         else host.attach(key, makeGuest(42).tab);
         expect(yield* Queue.take(leases)).toEqual({ ...active, active: false });
         if (lifecycle === "detach") host.attach(key, guest.tab);
-        pending.resolve({});
+        pending.resolve({ data: "discarded" });
         yield* command(2, "DOM.enable");
         expect((yield* Queue.take(replies)).id).toBe(2);
         yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)));
