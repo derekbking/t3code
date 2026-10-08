@@ -385,7 +385,7 @@ interface ManagedListeners {
   readonly webContents: Electron.WebContents;
 }
 
-type FrameCaptureConsumer = "picture-in-picture" | "recording";
+type FrameCaptureConsumer = "picture-in-picture" | "recording" | symbol;
 
 interface FrameCaptureSession {
   readonly recordingInputOptions?: RecordingInputOptions;
@@ -556,6 +556,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const browserHost = yield* DesktopBrowserHost.DesktopBrowserHost;
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
+  const runPromise = Effect.runPromiseWith(context);
   const resolvedArtifactDirectory = path.resolve(artifactDirectory);
 
   let forwardedShortcuts: ReadonlyArray<PreviewForwardedShortcut> = [];
@@ -2377,7 +2378,21 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       }
       if (afterAttach.serverTab) {
         yield* listenForAgentPointers;
-        browserHost.attach(afterAttach.serverTab, { webContents: wc, debugger: control.debugger });
+        browserHost.attach(afterAttach.serverTab, {
+          webContents: wc,
+          debugger: control.debugger,
+          withCaptureActivity: (capture, signal) => {
+            const consumer = Symbol("agent-screenshot");
+            return runPromise(
+              Effect.acquireUseRelease(
+                startFrameCapture(tabId, consumer),
+                () => Effect.promise((_signal) => capture()),
+                () => stopFrameCapture(tabId, consumer),
+              ),
+              { signal },
+            );
+          },
+        });
       }
       if (afterAttach.colorScheme !== "system") {
         yield* attemptPromise({ operation: "applyColorScheme", tabId, webContentsId: wc.id }, () =>

@@ -13,8 +13,11 @@ import {
   DesktopBrowserCommand,
   DesktopBrowserEvent,
   type DesktopBrowserEvent as DesktopBrowserEventType,
+  type DesktopPreviewCaptureRequest,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -38,6 +41,20 @@ export interface DesktopBrowserTabKey {
 export interface DesktopBrowserTabDebugger {
   readonly webContents: Electron.WebContents;
   readonly debugger: Electron.Debugger;
+  /** Shares the manager's recording/PiP throttling lease while preparing a still frame. */
+  readonly withCaptureActivity: (
+    capture: () => Promise<unknown>,
+    signal: AbortSignal,
+  ) => Promise<unknown>;
+}
+
+class DesktopBrowserCaptureError extends Schema.TaggedError<DesktopBrowserCaptureError>()(
+  "DesktopBrowserCaptureError",
+  { reason: Schema.String },
+) {
+  override get message(): string {
+    return `Desktop browser screenshot failed: ${this.reason}`;
+  }
 }
 
 const keyOf = ({ threadId, tabId }: DesktopBrowserTabKey) => `${threadId}\u0000${tabId}`;
@@ -46,6 +63,7 @@ interface AttachedTab {
   readonly key: DesktopBrowserTabKey;
   readonly debuggee: DesktopBrowserTabDebugger;
   relay: CdpRelayConnection | null;
+  relayAbort: AbortController | null;
   /** Where the server wants this tab's downloads; null keeps Electron's own handling. */
   downloadDirectory: string | null;
   /** The guid CDP gave the download that is about to start. */
@@ -74,6 +92,9 @@ export class DesktopBrowserHost extends Context.Service<
     readonly detach: (key: DesktopBrowserTabKey) => void;
     /** Points a server tab's download at the server; false for any other download. */
     readonly placeDownload: (source: Electron.WebContents, item: Electron.DownloadItem) => boolean;
+    /** Temporarily brings the matching guest into the renderer's paintable area. */
+    readonly captureRequests: Stream.Stream<DesktopPreviewCaptureRequest>;
+    readonly acknowledgeCapture: (requestId: string) => void;
     /** The agent's cursor positions for attached tabs, keyed by their server tab. */
     readonly pointers: Stream.Stream<{
       readonly key: DesktopBrowserTabKey;
@@ -92,19 +113,161 @@ export const make = Effect.gen(function* () {
     readonly x: number;
     readonly y: number;
   }>(16);
-  const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  const context = yield* Effect.context<never>();
+  const runFork = Effect.runForkWith(context);
+  const runPromise = Effect.runPromiseWith(context);
   const tabs = new Map<string, AttachedTab>();
+  const captureRequests = yield* PubSub.unbounded<DesktopPreviewCaptureRequest>();
+  const pendingCaptures = new Map<string, Deferred.Deferred<void>>();
+  // Neither capture API is cancellable. Retain the slot until the underlying
+  // work settles, even if its caller has timed out or released the relay.
+  const capturing = new WeakSet<Electron.WebContents>();
+  const capture = async (
+    tab: AttachedTab,
+    parameters: Readonly<Record<string, unknown>>,
+    relaySignal: AbortSignal,
+  ) => {
+    const { webContents, debugger: debuggee } = tab.debuggee;
+    if (capturing.has(webContents)) {
+      throw new DesktopBrowserCaptureError({ reason: "a previous capture is still pending." });
+    }
+    capturing.add(webContents);
+    let pending: Promise<unknown> | undefined;
+    const requireCurrent = (signal: AbortSignal) => {
+      signal.throwIfAborted();
+      if (tabs.get(keyOf(tab.key)) !== tab || webContents.isDestroyed()) {
+        throw new DesktopBrowserCaptureError({ reason: "the browser tab changed during capture." });
+      }
+    };
+    try {
+      return await tab.debuggee.withCaptureActivity(
+        () =>
+          runPromise(
+            Effect.acquireUseRelease(
+              Effect.gen(function* () {
+                const ready = yield* Deferred.make<void>();
+                const requestId = NodeCrypto.randomUUID();
+                pendingCaptures.set(requestId, ready);
+                return { requestId, ready, webContentsId: webContents.id };
+              }),
+              ({ requestId, ready, webContentsId }) =>
+                Effect.gen(function* () {
+                  yield* PubSub.publish(captureRequests, {
+                    requestId,
+                    webContentsId,
+                    active: true,
+                  });
+                  yield* Deferred.await(ready).pipe(
+                    Effect.timeoutOrElse({
+                      duration: "2 seconds",
+                      orElse: () =>
+                        Effect.fail(
+                          new DesktopBrowserCaptureError({
+                            reason:
+                              "the browser surface did not become paintable within 2 seconds.",
+                          }),
+                        ),
+                    }),
+                  );
+                  return yield* Effect.tryPromise({
+                    try: (signal) => {
+                      pending = (async () => {
+                        requireCurrent(signal);
+                        // CDP may resize the surface for a scaled clip. Request its
+                        // screenshot first, then produce an initial frame and, if
+                        // CDP is still waiting, a frame after that capture setup.
+                        let screenshotSettled = false;
+                        const screenshotRequest = Promise.resolve()
+                          .then(() => debuggee.sendCommand("Page.captureScreenshot", parameters))
+                          .finally(() => {
+                            screenshotSettled = true;
+                          });
+                        // Neither API is cancellable. Retain the slot until both
+                        // settle, including when one rejects or the caller times out.
+                        const [screenshot, warmup] = await Promise.allSettled([
+                          screenshotRequest,
+                          Promise.resolve().then(async () => {
+                            await webContents.capturePage(undefined, {
+                              stayHidden: true,
+                              stayAwake: false,
+                            });
+                            requireCurrent(signal);
+                            if (!screenshotSettled) {
+                              await webContents.capturePage(undefined, {
+                                stayHidden: true,
+                                stayAwake: false,
+                              });
+                            }
+                          }),
+                        ]);
+                        requireCurrent(signal);
+                        if (screenshot.status === "rejected") throw screenshot.reason;
+                        if (warmup.status === "rejected") throw warmup.reason;
+                        return screenshot.value;
+                      })();
+                      return pending;
+                    },
+                    catch: (cause) =>
+                      new DesktopBrowserCaptureError({
+                        reason:
+                          cause instanceof Error
+                            ? cause.message
+                            : "the compositor could not capture a frame.",
+                      }),
+                  }).pipe(
+                    Effect.timeoutOrElse({
+                      duration: "8 seconds",
+                      orElse: () =>
+                        Effect.fail(
+                          new DesktopBrowserCaptureError({
+                            reason: "the compositor did not supply a screenshot within 8 seconds.",
+                          }),
+                        ),
+                    }),
+                  );
+                }),
+              ({ requestId, webContentsId }) =>
+                Effect.gen(function* () {
+                  pendingCaptures.delete(requestId);
+                  yield* PubSub.publish(captureRequests, {
+                    requestId,
+                    webContentsId,
+                    active: false,
+                  });
+                }),
+            ),
+            { signal: relaySignal },
+          ),
+        relaySignal,
+      );
+    } finally {
+      const release = () => {
+        capturing.delete(webContents);
+      };
+      if (pending) void pending.then(release, release);
+      else release();
+    }
+  };
+  const releaseRelay = (tab: AttachedTab) => {
+    tab.relayAbort?.abort();
+    tab.relayAbort = null;
+    tab.relay = null;
+  };
   const emit = (event: DesktopBrowserEventType) => runFork(PubSub.publish(outbox, event));
 
   const relayFor = (tab: AttachedTab) => {
     if (tab.relay) return tab.relay;
     const { webContents, debugger: debuggee } = tab.debuggee;
+    const controller = new AbortController();
+    tab.relayAbort = controller;
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
         send: (method, params, sessionId) =>
-          sessionId === undefined
-            ? debuggee.sendCommand(method, params)
-            : debuggee.sendCommand(method, params, sessionId),
+          method === "Page.captureScreenshot" && sessionId === undefined
+            ? capture(tab, params, controller.signal)
+            : sessionId === undefined
+              ? debuggee.sendCommand(method, params)
+              : debuggee.sendCommand(method, params, sessionId),
         targetId: () =>
           debuggee
             .sendCommand("Target.getTargetInfo")
@@ -146,6 +309,7 @@ export const make = Effect.gen(function* () {
     const id = keyOf(key);
     const tab = tabs.get(id);
     if (!tab) return;
+    releaseRelay(tab);
     tabs.delete(id);
     tab.debuggee.debugger.off("message", tab.onMessage);
     emit({ type: "detached", ...key });
@@ -159,6 +323,7 @@ export const make = Effect.gen(function* () {
       key,
       debuggee,
       relay: null,
+      relayAbort: null,
       downloadDirectory: null,
       pendingDownloadGuid: null,
       onMessage: (_event, method, params, sessionId) => {
@@ -187,7 +352,7 @@ export const make = Effect.gen(function* () {
       }
       if (command.value.type === "release") {
         // A new server connection starts with a fresh relay and fresh sessions.
-        tab.relay = null;
+        releaseRelay(tab);
         return;
       }
       relayFor(tab).receive(command.value.message);
@@ -198,7 +363,7 @@ export const make = Effect.gen(function* () {
     Effect.forEach(
       [...tabs.values()],
       (tab) => {
-        tab.relay = null;
+        releaseRelay(tab);
         return PubSub.publish(outbox, { type: "attached", ...tab.key });
       },
       { discard: true },
@@ -206,6 +371,11 @@ export const make = Effect.gen(function* () {
   );
 
   return DesktopBrowserHost.of({
+    captureRequests: Stream.fromPubSub(captureRequests),
+    acknowledgeCapture: (requestId) => {
+      const ready = pendingCaptures.get(requestId);
+      if (ready) runFork(Deferred.succeed(ready, undefined));
+    },
     pointers: Stream.fromPubSub(pointers),
     // Subscribes before announcing, so no attach falls between the two.
     events: Stream.unwrap(
