@@ -27,9 +27,9 @@ import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
 import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
 import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
 import { OpenCodeDriver, type OpenCodeDriverEnv } from "./Drivers/OpenCodeDriver.ts";
-import { MuseDriver, type MuseDriverEnv } from "./Drivers/MuseDriver.ts";
-import { PiDriver, type PiDriverEnv } from "./Drivers/PiDriver.ts";
-import type { AnyProviderDriver } from "./ProviderDriver.ts";
+import { MuseDriver, type MuseDriverEnv } from "@t3tools/provider-muse/server";
+import { PiDriver, type PiDriverEnv } from "@t3tools/provider-pi/server";
+import type { AnyProviderDriver } from "@t3tools/provider-core/server/driver";
 
 /**
  * Union of infrastructure services required to construct any built-in
